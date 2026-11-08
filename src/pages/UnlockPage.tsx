@@ -1,4 +1,4 @@
-import { BookOpen } from 'lucide-react'
+import { AlertTriangle, BookOpen, ExternalLink } from 'lucide-react'
 import { useState } from 'react'
 import { Navigate } from 'react-router-dom'
 import { toast } from 'sonner'
@@ -7,6 +7,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { useVault } from '@/hooks/useVault'
+import { isSupabaseConfigured } from '@/services/supabase/client'
 
 export function UnlockPage({ mode }: { mode: 'setup' | 'unlock' }) {
   const { status, setup, unlock } = useVault()
@@ -36,6 +37,48 @@ export function UnlockPage({ mode }: { mode: 'setup' | 'unlock' }) {
     }
   }
 
+  // Show configuration warning if Supabase is not set up
+  if (!isSupabaseConfigured()) {
+    return (
+      <div className="flex min-h-svh items-center justify-center bg-background px-4">
+        <Card className="w-full max-w-md">
+          <CardHeader>
+            <div className="mb-2 flex h-11 w-11 items-center justify-center rounded-xl bg-destructive text-destructive-foreground">
+              <AlertTriangle className="h-5 w-5" />
+            </div>
+            <CardTitle>Supabase not configured</CardTitle>
+            <CardDescription>
+              Lexicon requires Supabase to securely store and synchronise your vocabulary across devices.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              Add the following to a <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">.env.local</code> file
+              in the project root, then restart the dev server:
+            </p>
+            <pre className="overflow-x-auto rounded-lg bg-muted p-3 text-xs font-mono leading-relaxed">
+              {`VITE_SUPABASE_URL=https://your-project.supabase.co
+VITE_SUPABASE_ANON_KEY=your-anon-key`}
+            </pre>
+            <a
+              href="https://supabase.com/dashboard"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1.5 text-sm text-primary hover:underline"
+            >
+              Open Supabase Dashboard
+              <ExternalLink className="h-3.5 w-3.5" />
+            </a>
+            <p className="text-xs text-muted-foreground">
+              See <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">supabase/README.md</code> in the project
+              for full setup instructions including Edge Function deployment.
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+    )
+  }
+
   return (
     <div className="flex min-h-svh items-center justify-center bg-background px-4">
       <Card className="w-full max-w-md">
@@ -46,8 +89,8 @@ export function UnlockPage({ mode }: { mode: 'setup' | 'unlock' }) {
           <CardTitle>{mode === 'setup' ? 'Create your private vault' : 'Unlock Lexicon'}</CardTitle>
           <CardDescription>
             {mode === 'setup'
-              ? 'Choose a passphrase you can remember on every device. It is never stored in plain text.'
-              : 'Enter the same passphrase to open your vocabulary on this device.'}
+              ? 'Choose a strong passphrase — it unlocks your vocabulary on every device. It is verified server-side and never stored.'
+              : 'Enter your passphrase to open your vocabulary. The same passphrase works across all your devices.'}
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -79,7 +122,9 @@ export function UnlockPage({ mode }: { mode: 'setup' | 'unlock' }) {
               </div>
             )}
             <Button className="w-full" type="submit" disabled={busy}>
-              {busy ? 'Please wait…' : mode === 'setup' ? 'Create vault' : 'Unlock'}
+              {busy
+                ? mode === 'setup' ? 'Creating vault…' : 'Unlocking…'
+                : mode === 'setup' ? 'Create vault' : 'Unlock'}
             </Button>
           </form>
         </CardContent>

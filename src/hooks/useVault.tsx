@@ -1,4 +1,12 @@
-import { createContext, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
+/**
+ * src/hooks/useVault.tsx
+ *
+ * Context provider for vault state.
+ * On boot: attempts to restore a previous session via refresh token (sessionStorage).
+ * If Supabase is not configured, shows a helpful error rather than a local fallback.
+ */
+
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from 'react'
 import {
   fetchRemoteVaultStatus,
   lockVault,
@@ -27,28 +35,63 @@ export function VaultProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     let cancelled = false
+
     async function boot() {
-      const restored = restoreSessionFromStorage()
-      if (restored) {
-        if (!cancelled) {
+      try {
+        // 1. Try to restore session from sessionStorage refresh token
+        const restored = await restoreSessionFromStorage()
+        if (restored && !cancelled) {
           setUserId(restored.userId)
           setStatus('unlocked')
+          return
         }
-        return
-      }
-      const local = await readLocalVaultMeta()
-      const remote = await fetchRemoteVaultStatus()
-      if (cancelled) return
-      if (remote.setupComplete || local.setupComplete) {
-        setStatus('locked')
-      } else {
-        setStatus('needs_setup')
+
+        // 2. Check remote vault status (requires network)
+        if (isSupabaseConfigured()) {
+          const remote = await fetchRemoteVaultStatus()
+          if (cancelled) return
+          if (!remote.reachable) {
+            // Network unavailable — check if we have a cached userId from a previous session
+            const local = await readLocalVaultMeta()
+            if (local.userId) {
+              // User has unlocked before on this device; show unlock screen
+              setStatus('locked')
+            } else {
+              // No prior session at all; we can't determine state
+              setStatus('needs_setup')
+            }
+            return
+          }
+          setStatus(remote.setupComplete ? 'locked' : 'needs_setup')
+        } else {
+          // Supabase not configured at all
+          setStatus('needs_setup')
+        }
+      } catch {
+        if (!cancelled) setStatus('needs_setup')
       }
     }
+
     void boot()
-    return () => {
-      cancelled = true
-    }
+    return () => { cancelled = true }
+  }, [])
+
+  const setup = useCallback(async (passphrase: string) => {
+    const id = await setupVault(passphrase)
+    setUserId(id)
+    setStatus('unlocked')
+  }, [])
+
+  const unlock = useCallback(async (passphrase: string) => {
+    const id = await unlockVault(passphrase)
+    setUserId(id)
+    setStatus('unlocked')
+  }, [])
+
+  const lock = useCallback(async () => {
+    await lockVault()
+    setUserId(null)
+    setStatus('locked')
   }, [])
 
   const value = useMemo<VaultContextValue>(
@@ -56,23 +99,11 @@ export function VaultProvider({ children }: { children: ReactNode }) {
       status,
       userId,
       cloudEnabled: isSupabaseConfigured(),
-      setup: async (passphrase: string) => {
-        const id = await setupVault(passphrase)
-        setUserId(id)
-        setStatus('unlocked')
-      },
-      unlock: async (passphrase: string) => {
-        const id = await unlockVault(passphrase)
-        setUserId(id)
-        setStatus('unlocked')
-      },
-      lock: async () => {
-        await lockVault()
-        setUserId(null)
-        setStatus('locked')
-      },
+      setup,
+      unlock,
+      lock,
     }),
-    [status, userId],
+    [status, userId, setup, unlock, lock],
   )
 
   return <VaultContext.Provider value={value}>{children}</VaultContext.Provider>

@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useVault } from '@/hooks/useVault'
 import {
@@ -11,11 +12,21 @@ import {
   updateSettings,
   updateWord,
 } from '@/services/vocabulary/repository'
-import { synchronise } from '@/services/sync/syncEngine'
+import { migrateLocalDataToCloud, synchronise } from '@/services/sync/syncEngine'
 
 export function useLibrary() {
   const { userId } = useVault()
   const queryClient = useQueryClient()
+  const migrationRan = useRef(false)
+
+  // On first unlock: migrate any local-only data to Supabase, then sync
+  useEffect(() => {
+    if (!userId || migrationRan.current) return
+    migrationRan.current = true
+    void migrateLocalDataToCloud(userId).then(() => synchronise()).then(() => {
+      void queryClient.invalidateQueries()
+    })
+  }, [userId, queryClient])
 
   const wordsQuery = useQuery({
     queryKey: ['words', userId],

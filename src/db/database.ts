@@ -32,6 +32,10 @@ export class LexiconDB extends Dexie {
       outbox: 'id, table, createdAt',
       vaultMeta: 'key',
     })
+    // v2: add compound index on words for userId+normalizedWord lookups
+    this.version(2).stores({
+      words: 'id, userId, normalizedWord, [userId+normalizedWord], createdAt, updatedAt, learningStatus, isFavourite, isDifficult, lastAccessedAt',
+    })
   }
 }
 

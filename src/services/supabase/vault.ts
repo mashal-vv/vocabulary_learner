@@ -1,226 +1,305 @@
+/**
+ * src/services/supabase/vault.ts
+ *
+ * Secure vault service — Supabase is the SINGLE source of truth.
+ *
+ * Authentication flow:
+ *   - vault-setup Edge Function:  passphrase → server-side PBKDF2 → Supabase Auth user (once)
+ *   - vault-unlock Edge Function: passphrase → server-side PBKDF2 → signInWithPassword → JWT
+ *   - The same passphrase always produces the same Supabase auth.uid() on every device.
+ *
+ * Session storage:
+ *   - Access token: memory only (never persisted)
+ *   - Refresh token: sessionStorage only (cleared on tab/window close)
+ *   - userId: IndexedDB (non-sensitive, used only as a cache key)
+ *   - Passphrase: NEVER stored anywhere
+ *   - Passphrase hash: NEVER stored client-side (server handles this)
+ */
+
+import { createClient } from '@supabase/supabase-js'
 import { db } from '@/db/database'
-import { encodePassphraseRecord, sha256Hex, verifyPassphrase } from '@/lib/crypto'
-import { evaluateUnlockAttempts } from '@/lib/rateLimit'
-import { functionsUrl, getSupabase, isSupabaseConfigured } from '@/services/supabase/client'
+import { functionsUrl, isSupabaseConfigured } from '@/services/supabase/client'
 
 export type VaultStatus = 'loading' | 'needs_setup' | 'locked' | 'unlocked'
 
-const LOCAL_ATTEMPTS_KEY = 'unlock_attempts'
+// ─── Types ────────────────────────────────────────────────────────────────────
 
 type Session = {
+  /** Short-lived Supabase JWT — memory only */
   accessToken: string
-  refreshToken?: string
+  /** Refresh token — sessionStorage only, cleared on tab close */
+  refreshToken: string
   userId: string
+  /** Unix ms timestamp of access token expiry */
   expiresAt: number
 }
 
+type VaultFunctionResponse = {
+  userId: string
+  accessToken: string
+  refreshToken: string
+  expiresAt: number
+}
+
+// ─── In-memory session ────────────────────────────────────────────────────────
+
+/** Access token lives ONLY in memory. Never in localStorage or IndexedDB. */
 let memorySession: Session | null = null
 
-export function getMemorySession() {
+export function getMemorySession(): Session | null {
   return memorySession
 }
 
-export async function readLocalVaultMeta() {
-  const userId = await db.vaultMeta.get('userId')
-  const hash = await db.vaultMeta.get('passphraseHash')
-  return {
-    userId: userId?.value,
-    passphraseHash: hash?.value,
-    setupComplete: Boolean(userId?.value && hash?.value),
-  }
+/** Returns a Supabase client authenticated as the current vault user. */
+export function getAuthenticatedClient() {
+  if (!memorySession) return null
+  const url = import.meta.env.VITE_SUPABASE_URL as string
+  const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string
+  if (!url || !anonKey) return null
+  return createClient(url, anonKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+    },
+    global: {
+      headers: {
+        Authorization: `Bearer ${memorySession.accessToken}`,
+      },
+    },
+  })
 }
 
-async function readAttempts() {
-  const row = await db.vaultMeta.get(LOCAL_ATTEMPTS_KEY)
-  if (!row?.value) return []
-  try {
-    return JSON.parse(row.value) as { attemptedAt: number; success: boolean }[]
-  } catch {
-    return []
-  }
-}
+// ─── Session helpers ──────────────────────────────────────────────────────────
 
-async function writeAttempts(attempts: { attemptedAt: number; success: boolean }[]) {
-  await db.vaultMeta.put({ key: LOCAL_ATTEMPTS_KEY, value: JSON.stringify(attempts.slice(-20)) })
-}
+const SESSION_KEY = 'lexicon_refresh'
 
-async function applySession(session: Session) {
+function writeSession(session: Session) {
   memorySession = session
-  const supabase = getSupabase()
-  if (supabase && session.refreshToken) {
-    await supabase.auth.setSession({
-      access_token: session.accessToken,
-      refresh_token: session.refreshToken,
-    })
-  }
-  sessionStorage.setItem(
-    'lexicon_session',
-    JSON.stringify({
-      accessToken: session.accessToken,
-      refreshToken: session.refreshToken,
-      userId: session.userId,
-      expiresAt: session.expiresAt,
-    }),
-  )
-}
-
-export function restoreSessionFromStorage() {
-  const raw = sessionStorage.getItem('lexicon_session')
-  if (!raw) return null
+  // Only the refresh token is persisted, in sessionStorage (cleared on tab close).
+  // The access token is never persisted.
   try {
-    const parsed = JSON.parse(raw) as Session
-    if (parsed.expiresAt > Date.now() + 5_000) {
-      memorySession = parsed
-      return parsed
-    }
+    sessionStorage.setItem(
+      SESSION_KEY,
+      JSON.stringify({
+        refreshToken: session.refreshToken,
+        userId: session.userId,
+        expiresAt: session.expiresAt,
+      }),
+    )
   } catch {
-    sessionStorage.removeItem('lexicon_session')
+    // sessionStorage unavailable — memory-only session is fine
   }
-  return null
 }
 
-async function callVaultFunction(name: string, body: Record<string, unknown>) {
-  const endpoint = functionsUrl(name)
-  const supabase = getSupabase()
-  if (!endpoint || !supabase) {
-    throw new Error('Cloud vault is not configured.')
+function clearSession() {
+  memorySession = null
+  try {
+    sessionStorage.removeItem(SESSION_KEY)
+  } catch {
+    // ignore
   }
+}
+
+/** Attempts to restore a previous session from sessionStorage using the refresh token. */
+export async function restoreSessionFromStorage(): Promise<Session | null> {
+  try {
+    const raw = sessionStorage.getItem(SESSION_KEY)
+    if (!raw) return null
+    const stored = JSON.parse(raw) as { refreshToken: string; userId: string; expiresAt: number }
+    if (!stored.refreshToken || !stored.userId) return null
+
+    // Always attempt a token refresh on restore — the access token was never persisted
+    const refreshed = await refreshVaultSession(stored.refreshToken, stored.userId)
+    return refreshed
+  } catch {
+    clearSession()
+    return null
+  }
+}
+
+// ─── Edge Function caller ─────────────────────────────────────────────────────
+
+async function callVaultFunction(name: string, body: Record<string, unknown>): Promise<VaultFunctionResponse> {
+  const endpoint = functionsUrl(name)
+  if (!endpoint) throw new Error('Supabase is not configured. Check VITE_SUPABASE_URL.')
+
   const response = await fetch(endpoint, {
     method: 'POST',
-    credentials: 'include',
     headers: {
       'Content-Type': 'application/json',
+      // Supabase Edge Functions require the anon key as Bearer token
       Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
     },
     body: JSON.stringify(body),
   })
-  const data = (await response.json().catch(() => ({}))) as Record<string, unknown>
-  if (!response.ok) {
-    throw new Error(typeof data.error === 'string' ? data.error : 'Vault request failed.')
-  }
-  return data
-}
 
-export async function fetchRemoteVaultStatus() {
-  if (!isSupabaseConfigured()) return { configured: false, setupComplete: false }
+  let data: Record<string, unknown> = {}
   try {
-    const data = await callVaultFunction('vault-status', {})
-    return {
-      configured: true,
-      setupComplete: Boolean(data.setupComplete),
-    }
+    data = (await response.json()) as Record<string, unknown>
   } catch {
-    return { configured: true, setupComplete: false, unreachable: true }
+    // empty body
+  }
+
+  if (!response.ok) {
+    const message = typeof data.error === 'string' ? data.error : `Request failed (${response.status})`
+    throw new Error(message)
+  }
+
+  return {
+    userId: String(data.userId ?? ''),
+    accessToken: String(data.accessToken ?? ''),
+    refreshToken: String(data.refreshToken ?? ''),
+    expiresAt: Number(data.expiresAt ?? Date.now() + 55 * 60_000),
   }
 }
 
-export async function setupVault(passphrase: string) {
+// ─── Public vault operations ──────────────────────────────────────────────────
+
+/**
+ * Checks whether the vault has been initialized on the server.
+ * Called on app boot to decide whether to show Setup or Unlock.
+ */
+export async function fetchRemoteVaultStatus(): Promise<{ setupComplete: boolean; reachable: boolean }> {
+  if (!isSupabaseConfigured()) return { setupComplete: false, reachable: false }
+  try {
+    const endpoint = functionsUrl('vault-status')
+    if (!endpoint) return { setupComplete: false, reachable: false }
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+      },
+      body: JSON.stringify({}),
+    })
+    if (!response.ok) return { setupComplete: false, reachable: true }
+    const data = (await response.json()) as { setupComplete: boolean }
+    return { setupComplete: Boolean(data.setupComplete), reachable: true }
+  } catch {
+    return { setupComplete: false, reachable: false }
+  }
+}
+
+/**
+ * First-time vault initialization.
+ * Creates a Supabase Auth user server-side and stores the vault identity.
+ * Throws if the vault is already initialized.
+ */
+export async function setupVault(passphrase: string): Promise<string> {
   if (passphrase.trim().length < 8) {
     throw new Error('Use a passphrase of at least 8 characters.')
   }
-  if (isSupabaseConfigured()) {
-    const data = await callVaultFunction('vault-setup', { passphrase })
-    const userId = String(data.userId)
-    await db.vaultMeta.put({ key: 'userId', value: userId })
-    await applySession({
-      accessToken: String(data.accessToken),
-      refreshToken: data.refreshToken ? String(data.refreshToken) : undefined,
-      userId,
-      expiresAt: Number(data.expiresAt ?? Date.now() + 14 * 60_000),
-    })
-    return userId
+  if (!isSupabaseConfigured()) {
+    throw new Error('Supabase is required for vault setup. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY to your .env.local file.')
   }
-  const record = await encodePassphraseRecord(passphrase)
-  const userId = crypto.randomUUID()
+
+  const result = await callVaultFunction('vault-setup', { passphrase })
+
+  // Store userId in IndexedDB as a non-sensitive cache key
   await db.vaultMeta.bulkPut([
-    { key: 'userId', value: userId },
-    { key: 'passphraseHash', value: record },
+    { key: 'userId', value: result.userId },
   ])
-  await applySession({
-    accessToken: 'local',
-    userId,
-    expiresAt: Date.now() + 12 * 60 * 60_000,
-  })
-  return userId
+  writeSession(result)
+
+  return result.userId
 }
 
-export async function unlockVault(passphrase: string) {
-  const attempts = await readAttempts()
-  const limit = evaluateUnlockAttempts(attempts)
-  if (!limit.allowed) {
-    throw new Error(`Too many attempts. Try again in ${limit.retryAfterSeconds} seconds.`)
+/**
+ * Unlocks the vault using the passphrase.
+ * The passphrase is sent to the Edge Function over HTTPS; the server
+ * verifies it and returns a time-limited JWT.
+ */
+export async function unlockVault(passphrase: string): Promise<string> {
+  if (passphrase.trim().length < 8) {
+    throw new Error('Passphrase must be at least 8 characters.')
+  }
+  if (!isSupabaseConfigured()) {
+    throw new Error('Supabase is not configured. This app requires a network connection to unlock.')
   }
 
+  const result = await callVaultFunction('vault-unlock', { passphrase })
+
+  await db.vaultMeta.put({ key: 'userId', value: result.userId })
+  writeSession(result)
+
+  return result.userId
+}
+
+/**
+ * Refreshes the access token using a refresh token.
+ * Returns the new session, or null if the refresh token is invalid.
+ */
+export async function refreshVaultSession(
+  refreshToken: string,
+  existingUserId?: string,
+): Promise<Session | null> {
+  if (!isSupabaseConfigured()) return null
   try {
-    if (isSupabaseConfigured()) {
-      const data = await callVaultFunction('vault-unlock', { passphrase })
-      const userId = String(data.userId)
-      await db.vaultMeta.put({ key: 'userId', value: userId })
-      await applySession({
-        accessToken: String(data.accessToken),
-        refreshToken: data.refreshToken ? String(data.refreshToken) : undefined,
-        userId,
-        expiresAt: Number(data.expiresAt ?? Date.now() + 14 * 60_000),
-      })
-      attempts.push({ attemptedAt: Date.now(), success: true })
-      await writeAttempts(attempts)
-      return userId
+    const result = await callVaultFunction('vault-refresh', { refreshToken })
+    const session: Session = {
+      accessToken: result.accessToken,
+      refreshToken: result.refreshToken || refreshToken,
+      userId: result.userId || existingUserId || '',
+      expiresAt: result.expiresAt,
     }
-
-    const meta = await readLocalVaultMeta()
-    if (!meta.passphraseHash || !meta.userId) {
-      throw new Error('The vault has not been set up yet.')
-    }
-    const ok = await verifyPassphrase(passphrase, meta.passphraseHash)
-    attempts.push({ attemptedAt: Date.now(), success: ok })
-    await writeAttempts(attempts)
-    if (!ok) throw new Error('That passphrase does not match.')
-    await applySession({
-      accessToken: 'local',
-      userId: meta.userId,
-      expiresAt: Date.now() + 12 * 60 * 60_000,
-    })
-    return meta.userId
-  } catch (error) {
-    if (!(error instanceof Error && error.message.includes('Too many'))) {
-      const failed = [...attempts, { attemptedAt: Date.now(), success: false }]
-      await writeAttempts(failed)
-    }
-    throw error
+    writeSession(session)
+    return session
+  } catch {
+    clearSession()
+    return null
   }
 }
 
-export async function lockVault() {
+/**
+ * Ensures the current access token is valid, refreshing if needed.
+ * Call this before any Supabase operation that requires auth.
+ */
+export async function ensureValidSession(): Promise<Session | null> {
+  if (!memorySession) return null
+  // Refresh if the token expires within 60 seconds
+  if (memorySession.expiresAt > Date.now() + 60_000) return memorySession
+  return refreshVaultSession(memorySession.refreshToken, memorySession.userId)
+}
+
+/**
+ * Locks the vault by clearing the in-memory session and sessionStorage.
+ * Supabase-side sign-out is best-effort (fires and forgets).
+ */
+export async function lockVault(): Promise<void> {
   const session = memorySession
-  memorySession = null
-  sessionStorage.removeItem('lexicon_session')
-  const supabase = getSupabase()
-  if (supabase) await supabase.auth.signOut()
-  if (isSupabaseConfigured() && session?.refreshToken) {
+  clearSession()
+  // Clear cached userId from IndexedDB (it will be re-fetched on next unlock)
+  // We keep it to avoid confusion — it is non-sensitive
+  if (session) {
+    // Best-effort server-side sign-out; ignore errors
     try {
-      await callVaultFunction('vault-lock', {
-        refreshTokenHash: await sha256Hex(session.refreshToken),
-      })
+      const endpoint = functionsUrl('vault-lock')
+      if (endpoint) {
+        void fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+          },
+          body: JSON.stringify({ refreshToken: session.refreshToken }),
+        })
+      }
     } catch {
-      // Local lock still succeeds if the network is unavailable.
+      // Lock is local regardless of server response
     }
   }
 }
 
-export async function refreshVaultSession() {
-  const session = memorySession ?? restoreSessionFromStorage()
-  if (!session) return null
-  if (!isSupabaseConfigured() || session.accessToken === 'local') return session
-  if (session.expiresAt > Date.now() + 30_000) return session
-  const data = await callVaultFunction('vault-refresh', {
-    refreshToken: session.refreshToken,
-  })
-  const next: Session = {
-    accessToken: String(data.accessToken),
-    refreshToken: data.refreshToken ? String(data.refreshToken) : session.refreshToken,
-    userId: String(data.userId ?? session.userId),
-    expiresAt: Number(data.expiresAt ?? Date.now() + 14 * 60_000),
+/**
+ * Reads the cached userId from IndexedDB.
+ * Used during boot to check whether a userId was previously stored
+ * (indicates a previously initialized vault on this device).
+ */
+export async function readLocalVaultMeta(): Promise<{ userId?: string; setupComplete: boolean }> {
+  const userId = await db.vaultMeta.get('userId')
+  return {
+    userId: userId?.value,
+    setupComplete: Boolean(userId?.value),
   }
-  await applySession(next)
-  return next
 }
