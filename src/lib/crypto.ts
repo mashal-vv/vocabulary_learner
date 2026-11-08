@@ -46,7 +46,7 @@ export async function verifyPassphrase(passphrase: string, record: string) {
   const actual = await hashPassphrase(passphrase, salt)
   if (actual.length !== expected.length) return false
   let diff = 0
-  for (let i = 0; i < actual.length; i += 1) diff |= actual[i] ^ expected[i]
+  for (let i = 0; i < actual.length; i += 1) diff |= (actual[i] ?? 0) ^ (expected[i] ?? 0)
   return diff === 0
 }
 
